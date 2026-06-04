@@ -1,0 +1,754 @@
+#include "Player/Character/BreakerCharacter.h"
+#include "EnhancedInputComponent.h"
+#include "InputAction.h"
+#include "Components\SpotLightComponent.h"
+#include "GameFramework/SpringArmComponent.h"
+#include "Camera/CameraComponent.h"
+#include "NiagaraFunctionLibrary.h"
+#include "InputTriggers.h"
+#include "EnhancedInputSubsystems.h"
+#include "GameFramework/CharacterMovementComponent.h"
+#include "Player/Component/PlayerStatComponent.h"
+#include "InputActionValue.h"
+#include "Player\Input\InputConfigData.h"
+#include "Item/ItemBase.h"
+#include "Item/Weapon/BaseWeaponTemplate.h"
+
+ABreakerCharacter::ABreakerCharacter()
+	: InputConfigData(nullptr)
+	, DefaultMappingContext(nullptr)
+	, bIsAiming(false)
+	, bIsSprint(false)
+	, CurrentAimSensitivity(AimSettings.NormalSensitivity)
+	, CurrentEquipState(EEquipState::Unarmed)
+	, CurrentActionState(EActionState::Idle)
+	, CurrentWeapon(nullptr)
+	, PrimaryWeapon(nullptr)
+	, SecondaryWeapon(nullptr)
+{
+	PrimaryActorTick.bCanEverTick = true;
+	CameraArm = CreateDefaultSubobject<USpringArmComponent>(TEXT("CameraArm"));
+	CameraArm->SetupAttachment(GetMesh(), FName(TEXT("spine_05")));
+
+	Camera = CreateDefaultSubobject<UCameraComponent>(TEXT("Camera"));
+	Camera->SetupAttachment(CameraArm);
+
+	Torch = CreateDefaultSubobject<USpotLightComponent>(TEXT("Torch"));
+	Torch->SetupAttachment(Camera);
+	Torch->SetRelativeLocation(FVector(350.f, 0.f, 0.f));
+
+	Torch->SetIntensityUnits(ELightUnits::Lumens);
+
+	Torch->Intensity = 100.0f;
+	Torch->AttenuationRadius = 2000.0f;
+
+	Torch->InnerConeAngle = 10.0f;
+	Torch->OuterConeAngle = 25.0f;
+
+	CurrentAimSensitivity = AimSettings.NormalSensitivity;
+
+	CameraArm->TargetArmLength = AimSettings.DefaultArmLength;
+
+	CameraArm->SocketOffset = AimSettings.DefaultArmSocketOffset;
+
+	PlayerStatComponent = CreateDefaultSubobject<UPlayerStatComponent>(TEXT("StatComponent"));
+}
+
+void ABreakerCharacter::BeginPlay()
+{
+	Super::BeginPlay();
+
+	GetCharacterMovement()->MaxWalkSpeed = MoveSettings.WalkSpeed;
+
+	Torch->SetVisibility(false);
+
+	PlayerStatComponent->OnDeath.AddUObject(this, &ABreakerCharacter::OnDeath);
+}
+
+void ABreakerCharacter::Tick(float DeltaTime)
+{
+	Super::Tick(DeltaTime);
+
+	UpdateAimZoom(DeltaTime);
+
+	UpdateWeaponTransform(DeltaTime);
+
+	UpdateWeaponIKWeight(DeltaTime);
+
+	UpdateWeaponIKTransform();
+
+	UpdateInteractionCheck();
+
+	UpdatePlayerStateDebugMessage();
+}
+
+void ABreakerCharacter::SetupPlayerInputComponent(UInputComponent* PlayerInputComponent)
+{
+	Super::SetupPlayerInputComponent(PlayerInputComponent);
+
+	if (UEnhancedInputComponent* EnhancedInputComponent = Cast<UEnhancedInputComponent>(PlayerInputComponent)) 
+	{
+
+		if (InputConfigData)
+		{
+			EnhancedInputComponent->BindAction(InputConfigData->JumpAction, ETriggerEvent::Started, this, &ACharacter::Jump);
+			EnhancedInputComponent->BindAction(InputConfigData->JumpAction, ETriggerEvent::Completed, this, &ACharacter::StopJumping);
+
+			EnhancedInputComponent->BindAction(InputConfigData->MoveAction, ETriggerEvent::Triggered, this, &ABreakerCharacter::Move);
+
+			EnhancedInputComponent->BindAction(InputConfigData->LookAction, ETriggerEvent::Triggered, this, &ABreakerCharacter::Look);
+
+			EnhancedInputComponent->BindAction(InputConfigData->AimAction, ETriggerEvent::Started, this, &ABreakerCharacter::StartAim);
+			EnhancedInputComponent->BindAction(InputConfigData->AimAction, ETriggerEvent::Completed, this, &ABreakerCharacter::StopAim);
+
+			EnhancedInputComponent->BindAction(InputConfigData->SprintAction, ETriggerEvent::Started, this, &ABreakerCharacter::StartSprint);
+			EnhancedInputComponent->BindAction(InputConfigData->SprintAction, ETriggerEvent::Completed, this, &ABreakerCharacter::StopSprint);
+
+			//EnhancedInputComponent->BindAction(InputConfigData->FireAction, ETriggerEvent::Started, this, &ABreakerCharacter::StartFire);
+			EnhancedInputComponent->BindAction(InputConfigData->FireAction, ETriggerEvent::Triggered, this, &ABreakerCharacter::StartFire);
+			//EnhancedInputComponent->BindAction(InputConfigData->FireAction, ETriggerEvent::Completed, this, &ABreakerCharacter::StopFire);
+
+			EnhancedInputComponent->BindAction(InputConfigData->PrimaryAction, ETriggerEvent::Started, this, &ABreakerCharacter::PrimaryEquipToggle);
+
+			EnhancedInputComponent->BindAction(InputConfigData->SecondaryAction, ETriggerEvent::Started, this, &ABreakerCharacter::SecondaryEquipToggle);
+
+			EnhancedInputComponent->BindAction(InputConfigData->TorchAction, ETriggerEvent::Started, this, &ABreakerCharacter::ToggleTorch);
+
+			EnhancedInputComponent->BindAction(InputConfigData->InteractAction, ETriggerEvent::Started, this, &ABreakerCharacter::OnInteractStarted);
+			EnhancedInputComponent->BindAction(InputConfigData->InteractAction, ETriggerEvent::Triggered, this, &ABreakerCharacter::OnInteractTriggered);
+			EnhancedInputComponent->BindAction(InputConfigData->InteractAction, ETriggerEvent::Completed, this, &ABreakerCharacter::OnInteractCanceled);
+			EnhancedInputComponent->BindAction(InputConfigData->InteractAction, ETriggerEvent::Canceled, this, &ABreakerCharacter::OnInteractCanceled);
+
+			EnhancedInputComponent->BindAction(InputConfigData->PrimaryDropAction, ETriggerEvent::Started, this, &ABreakerCharacter::DropPrimaryWeapon);
+
+			EnhancedInputComponent->BindAction(InputConfigData->SecondaryDropAction, ETriggerEvent::Started, this, &ABreakerCharacter::DropSecondaryWeapon);
+		}
+	}
+}
+
+void ABreakerCharacter::NotifyControllerChanged()
+{
+	if (APlayerController* PlayerController = Cast<APlayerController>(Controller))
+	{
+		if (UEnhancedInputLocalPlayerSubsystem* Subsystem = ULocalPlayer::GetSubsystem<UEnhancedInputLocalPlayerSubsystem>(PlayerController->GetLocalPlayer()))
+		{
+			Subsystem->AddMappingContext(DefaultMappingContext, 0);
+		}
+	}
+}
+
+float ABreakerCharacter::TakeDamage(float DamageAmount, FDamageEvent const& DamageEvent, AController* EventInstigator, AActor* DamageCauser)
+{
+	float Damage = Super::TakeDamage(DamageAmount, DamageEvent, EventInstigator, DamageCauser);
+
+	if (!(CurrentActionState == EActionState::Dead || CurrentActionState == EActionState::HitReaction))
+	{
+		HitReaction();
+		ApplyDamage(Damage);
+	}
+
+	return Damage;
+}
+
+void ABreakerCharacter::ApplyDamage(float Amount)
+{
+	if (PlayerStatComponent)
+	{
+		PlayerStatComponent->ApplyDamage(Amount);
+	}
+}
+
+void ABreakerCharacter::AimSetting()
+{
+	GetCharacterMovement()->MaxWalkSpeed = bIsAiming ? MoveSettings.AimSpeed : MoveSettings.WalkSpeed;
+	CurrentAimSensitivity = bIsAiming ? AimSettings.AimSensitivity : AimSettings.NormalSensitivity;
+}
+
+void ABreakerCharacter::UpdateAimZoom(float DeltaTime)
+{
+	float TargetArmLength = bIsAiming ? AimSettings.AimArmLength : AimSettings.DefaultArmLength;
+	FVector TargetOffset = bIsAiming ? AimSettings.AimArmSocketOffset : AimSettings.DefaultArmSocketOffset;
+	float InterpSpeed = bIsAiming ? AimSettings.AimInterpSpeed : AimSettings.DefaultInterpSpeed;
+	float TargetFOV = bIsAiming ? AimSettings.AimFOV : AimSettings.DefaultFOV;
+
+	Camera->SetFieldOfView(FMath::FInterpTo(Camera->FieldOfView, TargetFOV, DeltaTime, InterpSpeed));
+	CameraArm->TargetArmLength = FMath::FInterpTo(CameraArm->TargetArmLength, TargetArmLength, DeltaTime, InterpSpeed);
+	CameraArm->SocketOffset = FMath::VInterpTo(CameraArm->SocketOffset, TargetOffset, DeltaTime, InterpSpeed);
+}
+
+void ABreakerCharacter::StartAim()
+{
+	if (CurrentEquipState == EEquipState::Unarmed)
+	{
+		return;
+	}
+
+	if (bIsSprint)
+	{
+		StopSprint();
+	}
+
+	bIsAiming = true;
+	AimSetting();
+	OnAimingChanged.Broadcast(bIsAiming);
+}
+
+void ABreakerCharacter::StopAim()
+{
+	bIsAiming = false;
+	AimSetting();
+	OnAimingChanged.Broadcast(bIsAiming);
+}
+
+void ABreakerCharacter::StartFire()
+{
+	if (CurrentWeapon && CurrentEquipState != EEquipState::Unarmed && CurrentActionState == EActionState::Idle)
+	{
+		//bWantsToFire = true;
+		//CurrentWeapon->StartFire();
+		CurrentWeapon->Fire();
+	}
+}
+
+//void ABreakerCharacter::StopFire()
+//{
+//	bWantsToFire = false;
+//
+//	if (CurrentWeapon)
+//	{
+//		//CurrentWeapon->StopFire();
+//	}
+//}
+
+void ABreakerCharacter::StartSprint()
+{
+	if (bIsAiming || CurrentActionState == EActionState::Firing)
+	{
+		return;
+	}
+
+	bIsSprint = true;
+	GetCharacterMovement()->MaxWalkSpeed = MoveSettings.SprintSpeed;
+}
+
+void ABreakerCharacter::StopSprint()
+{
+	bIsSprint = false;
+	GetCharacterMovement()->MaxWalkSpeed = MoveSettings.WalkSpeed;
+}
+
+void ABreakerCharacter::ToggleTorch()
+{
+	if (Torch)
+	{
+		Torch->ToggleVisibility();
+	}
+}
+
+void ABreakerCharacter::Interaction()
+{
+	if (!TargetItem)
+	{
+		return;
+	}
+
+	ABaseWeaponTemplate* GroundWeapon = Cast<ABaseWeaponTemplate>(TargetItem);
+	if (GroundWeapon)
+	{
+		bool bHasPrimarySameType = PrimaryWeapon && (PrimaryWeapon->GetClass() == GroundWeapon->GetClass());
+		bool bHasSecondarySameType = SecondaryWeapon && (SecondaryWeapon->GetClass() == GroundWeapon->GetClass());
+
+		if (bHasPrimarySameType || bHasSecondarySameType)
+		{
+			ABaseWeaponTemplate* MyOwnedWeapon = bHasPrimarySameType ? PrimaryWeapon : SecondaryWeapon;
+
+			if (MyOwnedWeapon)
+			{
+				//MyOwnedWeapon->MaxAmmoAdd();
+
+				FString AmmoMessage = FString::Printf(TEXT("%s 탄약 충전!"), *GroundWeapon->ItemName.ToString());
+				OnItemAcquired.Broadcast(AmmoMessage);
+
+				TargetItem->Destroy();
+				TargetItem = nullptr;
+				OnTargetItemChanged.Broadcast(TEXT(""));
+			}
+			return;
+		}
+
+		bool bCanEquipAsMain = (GroundWeapon->SlotType == EItemSlotType::MainWeapon && !PrimaryWeapon);
+		bool bCanEquipAsSub = (GroundWeapon->SlotType == EItemSlotType::SubWeapon && !SecondaryWeapon);
+
+		if (bCanEquipAsMain || bCanEquipAsSub)
+		{
+			FActorSpawnParameters SpawnParams;
+			SpawnParams.Owner = this;
+			SpawnParams.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AdjustIfPossibleButAlwaysSpawn;
+			ABaseWeaponTemplate* NewWeapon = GetWorld()->SpawnActor<ABaseWeaponTemplate>(
+				GroundWeapon->GetClass(),
+				GetActorLocation(),
+				GetActorRotation(),
+				SpawnParams
+			);
+
+			//NewWeapon->SetCurrentAmmo(GroundWeapon->GetCurrentAmmo());
+			//UE_LOG(LogTemp, Log, TEXT("Current Ammo : %d"), NewWeapon->GetCurrentAmmo());
+
+			if (NewWeapon)
+			{
+				NewWeapon->Mesh->SetSimulatePhysics(false);
+				NewWeapon->Mesh->SetCollisionProfileName(TEXT("NoCollision"));
+				NewWeapon->SetActorEnableCollision(false);
+
+				if (NewWeapon->GetRootComponent())
+				{
+					NewWeapon->Mesh->AttachToComponent(NewWeapon->GetRootComponent(), FAttachmentTransformRules::SnapToTargetIncludingScale);
+				}
+
+				NewWeapon->Mesh->SetPhysicsLinearVelocity(FVector::ZeroVector);
+				NewWeapon->Mesh->SetPhysicsAngularVelocityInDegrees(FVector::ZeroVector);
+				NewWeapon->SetActorLocationAndRotation(GetActorLocation(), GetActorRotation(), false, nullptr, ETeleportType::TeleportPhysics);
+
+				FString AcquiredMessage = FString::Printf(TEXT("%s 장착 완료"), *NewWeapon->ItemName.ToString());
+				OnItemAcquired.Broadcast(AcquiredMessage);
+
+				if (NewWeapon->SlotType == EItemSlotType::MainWeapon)
+				{
+					PrimaryWeapon = NewWeapon;
+					InternalAttachWeapon(PrimaryWeapon, TEXT("PrimaryWeaponSocket"), PrimaryWeapon->HolsterOffset);
+				}
+				else
+				{
+					SecondaryWeapon = NewWeapon;
+					InternalAttachWeapon(SecondaryWeapon, TEXT("SecondaryWeaponSocket"), SecondaryWeapon->HolsterOffset);
+				}
+
+				GroundWeapon->Destroy();
+				TargetItem = nullptr;
+				OnTargetItemChanged.Broadcast(TEXT(""));
+			}
+		}
+		else
+		{
+			OnItemAcquired.Broadcast(TEXT("해당 무기 슬롯이 가득 찼습니다!"));
+		}
+	}
+}
+
+void ABreakerCharacter::ANAttachWeapon()
+{
+	if (CurrentWeapon && GetMesh())
+	{
+		FTransform WorldTransform = CurrentWeapon->GetActorTransform();
+
+		CurrentWeapon->AttachToComponent(GetMesh(), FAttachmentTransformRules::SnapToTargetIncludingScale, TEXT("WeaponSocket"));
+
+		CurrentWeapon->SetActorTransform(WorldTransform);
+
+		TargetWeaponTransform = CurrentWeapon->EquipOffset;
+
+		bIsInterpWeaponTransform = true;
+	}
+}
+
+void ABreakerCharacter::ANHolsterWeapon()
+{
+	if (CurrentWeapon && GetMesh())
+	{
+		FName TargetSocket = (CurrentWeapon->WeaponType == EWeaponType::Pistol) ? TEXT("SecondaryWeaponSocket") : TEXT("PrimaryWeaponSocket");
+
+		FTransform WorldTransform = CurrentWeapon->GetActorTransform();
+		CurrentWeapon->AttachToComponent(GetMesh(), FAttachmentTransformRules::SnapToTargetIncludingScale, TargetSocket);
+
+		CurrentWeapon->SetActorTransform(WorldTransform);
+
+		TargetWeaponTransform = CurrentWeapon->HolsterOffset;
+
+		bIsInterpWeaponTransform = true;
+	}
+}
+
+void ABreakerCharacter::InternalAttachWeapon(ABaseWeaponTemplate* Weapon, FName SocketName, const FTransform& Offset)
+{
+	if (!Weapon || !Weapon->Mesh || !GetMesh())
+	{
+		return;
+	}
+
+	Weapon->AttachToComponent(GetMesh(), FAttachmentTransformRules::SnapToTargetIncludingScale, SocketName);
+
+	Weapon->SetActorRelativeLocation(Offset.GetLocation());
+
+	Weapon->SetActorRelativeRotation(Offset.GetRotation());
+}
+
+void ABreakerCharacter::UpdateWeaponTransform(float DeltaTime)
+{
+	if (!bIsInterpWeaponTransform || !CurrentWeapon || !CurrentWeapon->Mesh)
+	{
+		return;
+	}
+
+	FVector CurrentLoc = CurrentWeapon->GetRootComponent()->GetRelativeLocation();
+	FRotator CurrentRot = CurrentWeapon->GetRootComponent()->GetRelativeRotation();
+
+	FVector TargetLoc = TargetWeaponTransform.GetLocation();
+	FRotator TargetRot = TargetWeaponTransform.GetRotation().Rotator();
+
+
+	FVector NewLoc = FMath::VInterpTo(CurrentLoc, TargetLoc, DeltaTime, WeaponInterpSpeed);
+	FRotator NewRot = FMath::RInterpTo(CurrentRot, TargetRot, DeltaTime, WeaponInterpSpeed);
+
+	CurrentWeapon->GetRootComponent()->SetRelativeLocation(NewLoc);
+	CurrentWeapon->GetRootComponent()->SetRelativeRotation(NewRot);
+
+	if (NewLoc.Equals(TargetLoc, 0.1f) && NewRot.Equals(TargetRot, 0.1f))
+	{
+		bIsInterpWeaponTransform = false;
+		CurrentWeapon->GetRootComponent()->SetRelativeLocation(TargetLoc);
+		CurrentWeapon->GetRootComponent()->SetRelativeRotation(TargetRot);
+	}
+}
+
+void ABreakerCharacter::UpdateWeaponIKTransform()
+{
+	if (CurrentEquipState != EEquipState::Unarmed && CurrentWeapon)
+	{
+		FTransform WeaponSocketTransform = CurrentWeapon->Mesh->GetSocketTransform(FName(TEXT("Socket_LeftHand")));
+		FVector WeaponIKLocation;
+		FRotator WeaponIKRotation;
+
+		GetMesh()->TransformToBoneSpace(FName(TEXT("hand_r")), WeaponSocketTransform.GetLocation(), WeaponSocketTransform.GetRotation().Rotator(), WeaponIKLocation, WeaponIKRotation);
+
+		WeaponEffector.SetLocation(WeaponIKLocation);
+		WeaponEffector.SetRotation(WeaponIKRotation.Quaternion());
+	}
+}
+
+void ABreakerCharacter::UpdateWeaponIKWeight(float DeltaTime)
+{
+	LeftHandIKAlpha = FMath::FInterpTo(LeftHandIKAlpha, TargetIKAlpha, DeltaTime, IKInterpSpeed);
+
+	if (FMath::IsNearlyEqual(LeftHandIKAlpha, TargetIKAlpha, 0.01f))
+	{
+		bIsIKAlpha = false;
+		LeftHandIKAlpha = TargetIKAlpha;
+	}
+}
+
+void ABreakerCharacter::OnEquipMontageEnd(UAnimMontage* Montage, bool bInterrupted)
+{
+	if (!bInterrupted)
+	{
+		TargetIKAlpha = 1.f;
+		bIsIKAlpha = true;
+	}
+}
+
+void ABreakerCharacter::UpdatePlayerStateDebugMessage()
+{
+	if (!bShowDebugPlayerState) return;
+
+	FString ActionStateString = UEnum::GetValueAsString(CurrentActionState);
+	FString EquipStateString = UEnum::GetValueAsString(CurrentEquipState);
+
+	FString SprintString = bIsSprint ? TEXT("Sprint : True") : TEXT("Sprint : False");
+	FString AimingString = bIsAiming ? TEXT("Aiming : True") : TEXT("Aiming : False");
+
+	if (GEngine)
+	{
+		GEngine->AddOnScreenDebugMessage(110, 0.f, FColor::Green, ActionStateString);
+		GEngine->AddOnScreenDebugMessage(111, 0.f, FColor::Green, EquipStateString);
+		GEngine->AddOnScreenDebugMessage(112, 0.f, FColor::Green, SprintString);
+		GEngine->AddOnScreenDebugMessage(113, 0.f, FColor::Green, AimingString);
+	}
+}
+
+void ABreakerCharacter::UpdateInteractionCheck()
+{
+	APlayerController* PlayerController = Cast<APlayerController>(GetController());
+	if (!PlayerController)
+	{
+		return;
+	}
+
+	// 화면 크기 가져오기
+	int32 ScreenWidth, ScreenHeight;
+	PlayerController->GetViewportSize(ScreenWidth, ScreenHeight);
+
+	// 화면 정중앙 2D 좌표 계산
+	FVector2D ScreenCenter(ScreenWidth * 0.5f, ScreenHeight * 0.5f);
+
+	FVector WorldLocation, WorldDirection;
+
+	// 2D 화면 중앙을 3D 월드 시작점과 방향 벡터로 변환
+	if (PlayerController->DeprojectScreenPositionToWorld(ScreenCenter.X, ScreenCenter.Y, WorldLocation, WorldDirection))
+	{
+		// 변환 성공 시, 기존 시작/끝 계산 방식 교체
+		FVector StartLocation = WorldLocation;
+		FVector End = StartLocation + (WorldDirection * InteractionDistance);
+
+		FHitResult HitResult;
+		FCollisionQueryParams Params;
+		Params.AddIgnoredActor(this);
+
+		FCollisionShape SweepSphere = FCollisionShape::MakeSphere(20.f);
+
+		bool bHit = GetWorld()->SweepSingleByChannel(
+			HitResult,
+			StartLocation,
+			End,
+			FQuat::Identity,
+			ECC_GameTraceChannel2,
+			SweepSphere,
+			Params
+		);
+
+		// 디버그 출력
+		//DrawDebugSphere(GetWorld(), HitResult.Location, 20.f, 12, bHit ? FColor::Green : FColor::Red, false, 0.1f);
+
+		if (bHit)
+		{
+			AItemBase* InteractionItem = Cast<AItemBase>(HitResult.GetActor());
+			if (InteractionItem && TargetItem != InteractionItem)
+			{
+				TargetItem = InteractionItem;
+				OnTargetItemChanged.Broadcast(TargetItem->ItemName.ToString());
+			}
+		}
+		else
+		{
+			if (TargetItem != nullptr)
+			{
+				TargetItem = nullptr;
+				OnTargetItemChanged.Broadcast(TEXT(""));
+			}
+		}
+	}
+}
+
+void ABreakerCharacter::PrimaryEquipToggle()
+{
+	if (PrimaryWeapon)
+	{
+		UAnimInstance* AnimInstance = GetMesh()->GetAnimInstance();
+
+		if (AnimInstance && CurrentEquipState == EEquipState::Unarmed && CurrentActionState == EActionState::Idle)
+		{
+			FOnMontageEnded EndDelegate;
+			CurrentWeapon = PrimaryWeapon;
+			AnimInstance->Montage_Play(CurrentWeapon->CharacterAnimMontages.Equip);
+			EndDelegate.BindUObject(this, &ABreakerCharacter::OnEquipMontageEnd);
+			AnimInstance->Montage_SetEndDelegate(EndDelegate, CurrentWeapon->CharacterAnimMontages.Equip);
+			return;
+		}
+
+		if (CurrentEquipState == EEquipState::Primary && CurrentActionState == EActionState::Idle)
+		{
+			PlayAnimMontage(CurrentWeapon->CharacterAnimMontages.Holster);
+			LeftHandIKAlpha = 0.f;
+			TargetIKAlpha = 0.f;
+			bIsIKAlpha = false;
+		}
+	}
+}
+
+void ABreakerCharacter::SecondaryEquipToggle()
+{
+	if (SecondaryWeapon)
+	{
+		UAnimInstance* AnimInstance = GetMesh()->GetAnimInstance();
+
+		if (AnimInstance && CurrentEquipState == EEquipState::Unarmed && CurrentActionState == EActionState::Idle)
+		{
+			FOnMontageEnded EndDelegate;
+			CurrentWeapon = SecondaryWeapon;
+			AnimInstance->Montage_Play(CurrentWeapon->CharacterAnimMontages.Equip);
+			EndDelegate.BindUObject(this, &ABreakerCharacter::OnEquipMontageEnd);
+			AnimInstance->Montage_SetEndDelegate(EndDelegate, CurrentWeapon->CharacterAnimMontages.Equip);
+			return;
+		}
+		if (CurrentEquipState == EEquipState::Secondary && CurrentActionState == EActionState::Idle)
+		{
+			PlayAnimMontage(CurrentWeapon->CharacterAnimMontages.Holster);
+			LeftHandIKAlpha = 0.f;
+			TargetIKAlpha = 0.f;
+			bIsIKAlpha = false;
+		}
+	}
+}
+
+void ABreakerCharacter::DropPrimaryWeapon()
+{
+	if (CurrentEquipState != EEquipState::Primary)
+	{
+		DropWeapon(EEquipState::Primary);
+	}
+}
+
+void ABreakerCharacter::DropSecondaryWeapon()
+{
+	if (CurrentEquipState != EEquipState::Secondary)
+	{
+		DropWeapon(EEquipState::Secondary);
+	}
+}
+
+void ABreakerCharacter::DropWeapon(EEquipState EquipState)
+{
+	ABaseWeaponTemplate* WeaponToDrop = nullptr;
+
+	if (EquipState == EEquipState::Primary)
+	{
+		WeaponToDrop = PrimaryWeapon;
+		PrimaryWeapon = nullptr;
+	}
+	else if (EquipState == EEquipState::Secondary)
+	{
+		WeaponToDrop = SecondaryWeapon;
+		SecondaryWeapon = nullptr;
+	}
+
+	if (!WeaponToDrop)
+	{
+		return;
+	}
+
+	WeaponToDrop->DetachFromActor(FDetachmentTransformRules::KeepWorldTransform);
+
+	WeaponToDrop->SetActorEnableCollision(true);
+	WeaponToDrop->SetOwner(nullptr);
+
+	WeaponToDrop->Mesh->SetCollisionProfileName(TEXT("Weapon"));
+	WeaponToDrop->Mesh->SetSimulatePhysics(true);
+
+	FVector DropDirection = GetActorForwardVector() + GetActorUpVector() * 0.2f; // 앞 + 위쪽 대각선 방향
+	DropDirection.Normalize();
+	float LaunchForce = 500.0f; // 던지는 힘 세기 
+
+	// 무기 메쉬에 순간적인 충격량을 가한다.
+	WeaponToDrop->Mesh->AddImpulse(DropDirection * LaunchForce, NAME_None, true);
+
+	OnItemAcquired.Broadcast(FString::Printf(TEXT("%s 버림"), *WeaponToDrop->ItemName.ToString()));
+}
+
+void ABreakerCharacter::HitReaction()
+{
+	if (CurrentWeapon && bWantsToFire)
+	{
+		//CurrentWeapon->StopFire();
+	}
+
+	if (CurrentEquipState == EEquipState::Unarmed)
+	{
+		PlayAnimMontage(AMHitReactionUnarmed);
+	}
+	else
+	{
+		PlayAnimMontage(AMHitReactionArmed);
+	}
+}
+
+void ABreakerCharacter::OnDeath()
+{
+
+	if (APlayerController* PlayerController = Cast<APlayerController>(GetController()))
+	{
+		StopAnimMontage();
+		DisableInput(PlayerController);
+
+		if (AM_Death)
+		{
+			PlayAnimMontage(AM_Death);
+		}
+	}
+}
+
+void ABreakerCharacter::OnInteractStarted()
+{
+	if (TargetItem)
+	{
+		InteractionCurrentTime = 0.f;
+		InteractionProgressPercent = 0.f;
+		OnInteractionProgressChanged.Broadcast(InteractionProgressPercent);
+	}
+}
+
+void ABreakerCharacter::OnInteractTriggered(const FInputActionInstance& Instance)
+{
+	if (!TargetItem)
+	{
+		InteractionCurrentTime = 0.f;
+		InteractionProgressPercent = 0.f;
+		OnInteractionProgressChanged.Broadcast(0.f);
+		return;
+	}
+
+	InteractionCurrentTime += GetWorld()->GetDeltaSeconds();
+
+	InteractionProgressPercent = FMath::Clamp(InteractionCurrentTime / InteractHoldTimeDuration, 0.f, 1.f);
+
+	OnInteractionProgressChanged.Broadcast(InteractionProgressPercent);
+
+	if (InteractionProgressPercent >= 1.f)
+	{
+		Interaction();
+		InteractionCurrentTime = 0.f;
+		InteractionProgressPercent = 0.f;
+		OnInteractionProgressChanged.Broadcast(InteractionProgressPercent);
+	}
+}
+
+void ABreakerCharacter::OnInteractCanceled()
+{
+	InteractionProgressPercent = 0.f;
+	InteractionCurrentTime = 0.f;
+	OnInteractionProgressChanged.Broadcast(InteractionProgressPercent);
+}
+
+void ABreakerCharacter::SetActionState(EActionState NewState)
+{
+	if (CurrentActionState != NewState)
+	{
+		CurrentActionState = NewState;
+		OnActionStateChanged.Broadcast(NewState);
+	}
+}
+
+void ABreakerCharacter::SetEquipState(EEquipState NewState)
+{
+	if (CurrentEquipState != NewState)
+	{
+		CurrentEquipState = NewState;
+		OnEquipStateChanged.Broadcast(CurrentEquipState);
+	}
+}
+
+void ABreakerCharacter::Move(const FInputActionValue& Value)
+{
+	FVector2D MovementVector = Value.Get<FVector2D>();
+
+	if (Controller != nullptr)
+	{
+		const FRotator Rotation = Controller->GetControlRotation();
+		const FRotator YawRotation(0, Rotation.Yaw, 0);
+
+		const FVector ForwardDirection = FRotationMatrix(YawRotation).GetUnitAxis(EAxis::X);
+
+		const FVector RightDirection = FRotationMatrix(YawRotation).GetUnitAxis(EAxis::Y);
+
+		AddMovementInput(ForwardDirection, MovementVector.Y);
+		AddMovementInput(RightDirection, MovementVector.X);
+	}
+}
+
+void ABreakerCharacter::Look(const FInputActionValue& Value)
+{
+	FVector2D LookAxisVector = Value.Get<FVector2D>();
+
+	if (Controller != nullptr)
+	{
+		AddControllerYawInput(LookAxisVector.X * CurrentAimSensitivity);
+		AddControllerPitchInput(LookAxisVector.Y * CurrentAimSensitivity);
+	}
+}
